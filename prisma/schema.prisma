@@ -1,0 +1,270 @@
+// ==========================================================
+// BizLedger — Prisma Schema
+// Phase 1 ships every table below. Phase 2-4 fields (source,
+// rawMessage, telegramChatId, PendingMessage, Notification)
+// are included now so later phases need zero migrations to
+// *add* core concepts — only to populate them.
+// ==========================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // swap to "sqlite" for local dev with url = "file:./dev.db"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------- Enums -----------------------
+
+enum Role {
+  ADMIN
+  MANAGER
+  ACCOUNTANT
+  STAFF
+}
+
+enum TransactionType {
+  EXPENSE
+  INCOME
+}
+
+enum PaymentMode {
+  CASH
+  BANK_TRANSFER
+  UPI
+  CARD
+  CHEQUE
+  OTHER
+}
+
+enum TransactionSource {
+  WEB
+  TELEGRAM
+  WHATSAPP
+}
+
+enum LedgerEntryType {
+  SALE        // customer ledger: invoice raised
+  PAYMENT_IN  // customer ledger: payment received
+  PURCHASE    // supplier ledger: goods/services purchased
+  PAYMENT_OUT // supplier ledger: payment made
+}
+
+enum NotificationType {
+  LARGE_EXPENSE
+  DAILY_SUMMARY
+  WEEKLY_SUMMARY
+  MONTHLY_SUMMARY
+  FAILED_PARSE
+  SUSPICIOUS_TRANSACTION
+}
+
+// ----------------------- Core Models -----------------------
+
+model User {
+  id              String   @id @default(cuid())
+  name            String
+  email           String   @unique
+  passwordHash    String
+  role            Role
+  isActive        Boolean  @default(true)
+  telegramChatId  String?  @unique // Phase 2: links bot sender to this user
+  whatsappPhone   String?  @unique // Phase 4
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  transactionsEntered Transaction[] @relation("EnteredBy")
+  auditLogs           AuditLog[]
+  notifications       Notification[]
+}
+
+model Business {
+  id        String   @id @default(cuid())
+  name      String   @unique // "Wholesale", "Retail"
+  slug      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  transactions Transaction[]
+  customers    Customer[]
+  suppliers    Supplier[]
+}
+
+model Category {
+  id        String          @id @default(cuid())
+  name      String          @unique
+  type      TransactionType @default(EXPENSE)
+  isDefault Boolean         @default(false)
+  createdAt DateTime        @default(now())
+
+  transactions Transaction[]
+}
+
+model Customer {
+  id         String   @id @default(cuid())
+  name       String
+  phone      String?
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  createdAt  DateTime @default(now())
+
+  transactions  Transaction[]
+  ledgerEntries CustomerLedgerEntry[]
+
+  @@index([businessId])
+}
+
+model Supplier {
+  id         String   @id @default(cuid())
+  name       String
+  phone      String?
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  createdAt  DateTime @default(now())
+
+  transactions  Transaction[]
+  ledgerEntries SupplierLedgerEntry[]
+
+  @@index([businessId])
+}
+
+model Transaction {
+  id          String            @id @default(cuid())
+  type        TransactionType
+  amount      Decimal           @db.Decimal(14, 2)
+  description String?
+  date        DateTime          @default(now())
+  paymentMode PaymentMode       @default(CASH)
+
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+
+  supplierId String?
+  supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  enteredById String
+  enteredBy   User   @relation("EnteredBy", fields: [enteredById], references: [id])
+
+  // Phase 2-4 provenance — present from Phase 1, populated later
+  source     TransactionSource @default(WEB)
+  rawMessage String?           // original WhatsApp/Telegram text, if any
+
+  attachments Attachment[]
+  auditLogs   AuditLog[]
+  customerLedgerEntry CustomerLedgerEntry?
+  supplierLedgerEntry SupplierLedgerEntry?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessId, date])
+  @@index([type])
+  @@index([customerId])
+  @@index([supplierId])
+}
+
+// Running-balance ledger rows, written whenever a Transaction
+// touches a customer/supplier. Keeping these as separate tables
+// (instead of recomputing on the fly) makes "running balance after
+// every transaction" O(1) to display.
+
+model CustomerLedgerEntry {
+  id            String          @id @default(cuid())
+  customerId    String
+  customer      Customer        @relation(fields: [customerId], references: [id])
+  transactionId String          @unique
+  transaction   Transaction     @relation(fields: [transactionId], references: [id])
+  entryType     LedgerEntryType // SALE | PAYMENT_IN
+  amount        Decimal         @db.Decimal(14, 2)
+  runningBalance Decimal        @db.Decimal(14, 2) // outstanding after this entry
+  createdAt     DateTime        @default(now())
+
+  @@index([customerId])
+}
+
+model SupplierLedgerEntry {
+  id            String          @id @default(cuid())
+  supplierId    String
+  supplier      Supplier        @relation(fields: [supplierId], references: [id])
+  transactionId String          @unique
+  transaction   Transaction     @relation(fields: [transactionId], references: [id])
+  entryType     LedgerEntryType // PURCHASE | PAYMENT_OUT
+  amount        Decimal         @db.Decimal(14, 2)
+  runningBalance Decimal        @db.Decimal(14, 2) // payable after this entry
+  createdAt     DateTime        @default(now())
+
+  @@index([supplierId])
+}
+
+model Attachment {
+  id            String      @id @default(cuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  url           String
+  fileName      String
+  mimeType      String
+  // OCR fields — nullable, populated by a future OCR phase
+  ocrAmount      Decimal? @db.Decimal(14, 2)
+  ocrVendor      String?
+  ocrDate        DateTime?
+  ocrGstNumber   String?
+  ocrRawText     String?
+  createdAt     DateTime    @default(now())
+
+  @@index([transactionId])
+}
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  entityType    String   // "Transaction", "User", etc.
+  entityId      String
+  action        String   // "CREATE" | "UPDATE" | "DELETE"
+  oldValue      Json?
+  newValue      Json?
+  actorId       String
+  actor         User     @relation(fields: [actorId], references: [id])
+  transactionId String?
+  transaction   Transaction? @relation(fields: [transactionId], references: [id])
+  createdAt     DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  type      NotificationType
+  title     String
+  message   String
+  isRead    Boolean          @default(false)
+  userId    String?
+  user      User?            @relation(fields: [userId], references: [id])
+  createdAt DateTime         @default(now())
+}
+
+// Phase 2/3: low-confidence bot messages parked for clarification
+// instead of being guessed. Table exists from Phase 1's schema so
+// no migration is needed when Phase 2 starts writing to it.
+model PendingMessage {
+  id           String   @id @default(cuid())
+  source       TransactionSource
+  rawMessage   String
+  senderId     String   // telegram chat id / whatsapp phone
+  parsedDraft  Json?    // best-guess ParsedTransactionDraft, if any
+  resolved     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+}
+
+model OpeningBalance {
+  id         String   @id @default(cuid())
+  businessId String   @unique
+  amount     Decimal  @db.Decimal(14, 2) @default(0)
+  asOfDate   DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
